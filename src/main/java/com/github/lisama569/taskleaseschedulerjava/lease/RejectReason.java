@@ -17,6 +17,10 @@ public enum RejectReason {
     RETRY_BACKOFF_NOT_ELAPSED,
     /** 执行失败（已上报并进入重试链路）。 */
     EXECUTION_FAILED,
+    /** 执行超过时限被中止：已按一次可恢复失败上报，任务进入重试链路。 */
+    EXECUTION_TIMEOUT,
+    /** 执行被外部中断（线程中断/实例停机）：结论确定为失败，绝不当成功提交。 */
+    EXECUTION_INTERRUPTED,
     /** 参数非法。 */
     INVALID_ARGUMENT
 }

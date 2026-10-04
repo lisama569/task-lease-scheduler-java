@@ -1,7 +1,11 @@
 package com.github.lisama569.taskleaseschedulerjava.lease;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /** 任务的本地共享状态（多实例通过同一 LeaseManager 竞争它）。 */
@@ -19,6 +23,12 @@ public final class TaskRecord {
     private String result;
     /** 已应用结果的业务键，保证幂等。 */
     private final Set<String> appliedBusinessKeys = new HashSet<>();
+    /**
+     * 步骤级进度：step -> 完成标记（含完成时的租约版本）。
+     * 只属于当前这条“持有者/重试血缘”；租约过期、被回收、被接管或主动释放时整体清空，
+     * 新持有者从干净起点开始，旧进度绝不会串到新持有者头上。
+     */
+    private final Map<String, StepProgress> stepProgress = new LinkedHashMap<>();
 
     public TaskRecord(String taskId, int maxAttempts) {
         this.taskId = taskId;
@@ -44,4 +54,25 @@ public final class TaskRecord {
     public void result(String r) { this.result = r; }
     public boolean hasApplied(String businessKey) { return appliedBusinessKeys.contains(businessKey); }
     public void markApplied(String businessKey) { appliedBusinessKeys.add(businessKey); }
+
+    /** 某步骤是否已在当前持有者血缘中完成。 */
+    public boolean isStepDone(String step) {
+        StepProgress p = stepProgress.get(step);
+        return p != null && p.completed();
+    }
+
+    /** 记录步骤完成，归属到取得该结果时的租约版本。 */
+    public void markStepDone(String step, long ownerVersion, Instant at) {
+        stepProgress.put(step, StepProgress.completed(step, ownerVersion, at));
+    }
+
+    /** 当前血缘的步骤进度快照（按完成顺序）。 */
+    public List<StepProgress> steps() {
+        return new ArrayList<>(stepProgress.values());
+    }
+
+    /** 清空旧持有者血缘的步骤进度：新持有者必须拿到干净、确定的起点。 */
+    public void clearSteps() {
+        stepProgress.clear();
+    }
 }

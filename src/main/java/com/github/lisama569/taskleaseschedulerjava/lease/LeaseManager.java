@@ -68,8 +68,14 @@ public class LeaseManager {
                 }
                 default -> { /* PENDING: fall through */ }
             }
+            // 只有“合作式失败后退避到期”的重试血缘才续用已有步骤进度；
+            // 首次抢占、租约过期后的接管一律从干净起点开始，旧持有者进度不得串过来。
+            boolean retryLineage = r.status() == TaskStatus.RETRY_WAITING;
             long newVersion = r.nextVersion();
             Lease lease = new Lease(taskId, ownerId, newVersion, now, now.plus(ttl));
+            if (!retryLineage) {
+                r.clearSteps();
+            }
             r.lease(lease);
             r.status(TaskStatus.LEASED);
             r.incrementAttempts();
@@ -111,6 +117,7 @@ public class LeaseManager {
             }
             r.lease(null);
             r.status(TaskStatus.PENDING);
+            r.clearSteps();
             return LeaseDecision.ok(null);
         }
     }
@@ -175,6 +182,53 @@ public class LeaseManager {
         }
     }
 
+    /** 查询当前持有者血缘已完成的步骤（进度跟租约走，过期/接管后已清空）。 */
+    public java.util.List<StepProgress> stepProgress(String taskId) {
+        TaskRecord r = tasks.get(taskId);
+        if (r == null) {
+            return java.util.List.of();
+        }
+        synchronized (r) {
+            return r.steps();
+        }
+    }
+
+    /**
+     * 标记一个步骤完成：仅当前持有者（owner+version 匹配且未过期）可写。
+     * 已完成的步骤重复标记无副作用（步骤级幂等）。
+     */
+    public LeaseDecision markStepDone(String taskId, String ownerId, long version, String step) {
+        if (step == null || step.isBlank()) {
+            return LeaseDecision.rejected(RejectReason.INVALID_ARGUMENT, "step required");
+        }
+        TaskRecord r = tasks.get(taskId);
+        if (r == null) {
+            return LeaseDecision.rejected(RejectReason.TASK_NOT_FOUND, "no such task: " + taskId);
+        }
+        synchronized (r) {
+            Lease cur = r.lease();
+            RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
+            if (invalid != null) {
+                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version));
+            }
+            if (!r.isStepDone(step)) {
+                r.markStepDone(step, version, clock.now());
+            }
+            return LeaseDecision.ok(cur);
+        }
+    }
+
+    /** 查询某步骤在当前持有者血缘中是否已完成（不存在任务视为 false）。 */
+    public boolean isStepDone(String taskId, String step) {
+        TaskRecord r = tasks.get(taskId);
+        if (r == null) {
+            return false;
+        }
+        synchronized (r) {
+            return r.isStepDone(step);
+        }
+    }
+
     /** 取消任务：终态，不再被调度；已终态则返回 false。 */
     public boolean cancel(String taskId) {
         TaskRecord r = tasks.get(taskId);
@@ -188,6 +242,7 @@ public class LeaseManager {
             }
             r.lease(null);
             r.status(TaskStatus.CANCELLED);
+            r.clearSteps();
             return true;
         }
     }
@@ -202,6 +257,7 @@ public class LeaseManager {
                         && r.lease().isExpired(now)) {
                     r.lease(null);
                     r.status(TaskStatus.PENDING);
+                    r.clearSteps();
                     reclaimed++;
                 }
             }
@@ -266,23 +322,37 @@ public class LeaseManager {
         return out;
     }
 
-    /** 持有者校验：依次区分 非持有者 / 版本被取代 / 租约过期。 */
+    /**
+     * 持有者校验，精确区分三类拒绝：
+     * <ul>
+     *   <li>owner/version 都是当前租约，仅时间到期 -> LEASE_EXPIRED（还没人接管）；</li>
+     *   <li>版本对不上当前租约（持有者已换人，或同一人已用新版本重新抢占）
+     *       -> OWNERSHIP_SUPERSEDED（任务已被新持有者接管）；</li>
+     *   <li>当前无租约，或提交者根本不是该版本的归属人 -> NOT_LEASE_HOLDER。</li>
+     * </ul>
+     */
     private static RejectReason checkHolder(TaskRecord r, Lease cur, String ownerId,
                                             long version, Instant now) {
         if (r.status() == TaskStatus.CANCELLED || r.status() == TaskStatus.DEAD
                 || r.status() == TaskStatus.SUCCEEDED) {
             return RejectReason.TASK_FINISHED;
         }
-        if (cur == null || !cur.ownerId().equals(ownerId)) {
+        if (cur == null) {
             return RejectReason.NOT_LEASE_HOLDER;
         }
-        if (cur.version() != version) {
-            return RejectReason.OWNERSHIP_SUPERSEDED;
+        if (cur.ownerId().equals(ownerId)) {
+            if (cur.version() != version) {
+                return RejectReason.OWNERSHIP_SUPERSEDED;
+            }
+            if (cur.isExpired(now)) {
+                return RejectReason.LEASE_EXPIRED;
+            }
+            return null;
         }
-        if (cur.isExpired(now)) {
-            return RejectReason.LEASE_EXPIRED;
-        }
-        return null;
+        // 当前持有者是别人：拿着当前版本来的是冒充者；拿着旧版本来的是被接管的旧持有者。
+        return cur.version() == version
+                ? RejectReason.NOT_LEASE_HOLDER
+                : RejectReason.OWNERSHIP_SUPERSEDED;
     }
 
     private static String describe(Lease cur, String ownerId, long version) {
