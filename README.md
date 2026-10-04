@@ -1,7 +1,7 @@
 # task-lease-scheduler-java
 
 本地可运行的任务租约调度示例：以本地共享内存状态模拟多实例竞争，保证同一任务在并发抢占、
-租约失效与失败重试下的执行结论唯一、确定且可解释。无外网、无外部服务依赖。
+租约失效、执行超时/打断与失败重试下的执行结论唯一、确定且可解释。无外网、无外部服务依赖。
 
 ## 核心概念
 
@@ -12,6 +12,8 @@
 - 任意时刻同一任务最多一个有效持有者；所有判定在 per-task 监视器锁内完成，
   并发抢占得到唯一结果：胜者拿到 `LeaseDecision.acquired=true`，
   其余竞争者得到 `LEASE_HELD_BY_OTHER` 及当前持有者与版本信息。
+- 所有判定结果（`LeaseDecision` / `SubmitOutcome` / `ProgressView`）都携带
+  **租约版本与拒绝原因**，便于复现和解释每一步。
 
 ### 租约状态流转
 
@@ -22,6 +24,7 @@
    │ release                 │  ├── submitResult ──► SUCCEEDED (终态)
    │                         │  ├── reportFailure(RETRYABLE, 未超上限) ──► RETRY_WAITING
    │                         │  ├── reportFailure(NON_RETRYABLE 或超上限) ─► DEAD (终态)
+   │                         │  ├── 执行超时/被打断 ──► reportFailure(RETRYABLE) ─► RETRY_WAITING
    │                         │  └── 租约到期 reclaimExpired ──► PENDING
    │                         │
    └─────────────────────────┘
@@ -34,6 +37,45 @@
 - **续约 renew**：仅当前持有者（owner + version 匹配且未过期）可续，版本不变、过期时间顺延。
 - **释放 release**：仅当前持有者可释放，任务回到 PENDING。
 - **到期回收 reclaimExpired**：过期租约被回收为 PENDING；`acquire`/`schedulable` 也会惰性回收。
+
+### 执行时限与打断（TaskScheduler）
+
+每次执行都有明确的**时间上限**，不再依赖租约被动到期来兜底：
+
+- `runOnce(taskId, ownerId, businessKey, executionTimeout, executor)`：
+  执行在受控线程中运行，调度线程以 `executionTimeout` 为上限等待结果。
+- **超时**：取消执行线程（中断），按可恢复失败上报（`RETRY_WAITING` + 退避），
+  返回 `EXECUTION_TIMEOUT`。任务立刻回到可调度状态，而不是干等租约到期。
+- **外部打断**（调度线程被中断、实例停机）：取消执行、恢复中断标记、按可恢复失败上报，
+  返回 `EXECUTION_INTERRUPTED`；执行期间若观察到中断信号，即使 executor 已返回结果
+  也**不会提交**——没跑完/可能不完整的执行绝不会被当成成功。
+- **异常**：executor 抛异常按可重试失败上报，返回 `EXECUTION_FAILED`。
+- 超时/打断后租约已被释放，原持有者再提交结果会被拒绝，且原因可区分：
+  - 租约已释放/被他人持有 → `NOT_LEASE_HOLDER`
+  - 同一持有者重新抢到租约（版本已 +1）→ `OWNERSHIP_SUPERSEDED`
+  - 租约自然过期 → `LEASE_EXPIRED`
+  无论哪种情况，旧持有者都**无法覆盖**新持有者的状态。
+
+### 步骤级进度与续跑（可选 API）
+
+真实任务常是一串步骤，前面步骤可能已产生外部副作用，重试时不能整段重跑：
+
+- `LeaseManager.recordStep(taskId, ownerId, version, stepKey, note)`：
+  仅当前持有者可记录；同一 `stepKey` 重复记录幂等。
+- `LeaseManager.progress(taskId, ownerId, version)`：
+  仅当前持有者可查询自己的已完成步骤（按记录顺序）。
+- `TaskScheduler.runSteps(taskId, ownerId, businessKey, executionTimeout, List<TaskStep>)`：
+  执行前查询进度并**跳过已完成步骤**，每完成一步即记录；重试/恢复时只跑没做过的部分。
+  执行途中若租约丢失（被回收/取代），立即中止并以对应原因拒绝，不提交结果。
+
+**进度所有权隔离**：
+
+- 进度跟着租约持有者走。租约过期、被回收或被别人抢走后，旧持有者留下的进度
+  **不会算到新持有者头上**：不同 owner 获取租约时旧进度被清除，新持有者拿到
+  干净、确定的起点（空进度）。
+- 同一 owner 因重试/恢复重新获得租约时，继承自己之前记录的进度，已完成步骤不重复执行。
+- 任务进入终态（SUCCEEDED/DEAD/CANCELLED）时进度被清除。
+- 这套机制完全可选：不关心中间进度的任务继续只用 `runOnce`，无需任何改动。
 
 ### 幂等与所有权约束（结果提交）
 
@@ -55,7 +97,7 @@
 
 - `ErrorKind.RETRYABLE`：执行超时、中断、下游暂时不可用。任务进入 `RETRY_WAITING`，
   按指数退避（`baseBackoff << (attempt-1)`，封顶 `maxBackoff`）等待后重新调度；
-  已提交的业务键不会重复执行（幂等保证）。
+  已提交的业务键不会重复执行（幂等保证），已记录的步骤不会被新持有者继承（进度隔离）。
 - `ErrorKind.NON_RETRYABLE`：参数非法、业务校验失败等，直接进入 `DEAD` 终态。
 - 重试次数达到 `maxAttempts` 后进入 `DEAD`；`CANCELLED`/`DEAD`/`SUCCEEDED` 均不再被调度。
 - `RetryPolicy.defaults()`：3 次尝试、100ms 基础退避、5s 上限（测试可自定义）。
@@ -68,31 +110,84 @@
 - `schedulable()`：当前可调度任务；
 - `byOwner(ownerId)`：按持有者过滤；
 - `byLeaseRemainingWithin(millis)`：按租约剩余时间过滤；
-- `byFailureReason(reason)`：按失败原因过滤。
+- `byFailureReason(reason)`：按失败原因过滤；
+- `progress(taskId, ownerId, version)`：当前持有者的步骤进度。
 
 ## 本地验证
 
+### 自动化测试
+
 ```bash
-# 全部测试（并发抢占 / 租约到期 / 幂等重复提交 / 失败恢复，使用 MutableClock 可控时间源，无真实等待）
+# 全部测试：并发抢占 / 租约到期 / 幂等重复提交 / 失败恢复 / 执行超时与打断 / 步骤进度隔离
+# 租约与退避时间使用 MutableClock 可控时间源，无真实等待；
+# 执行超时本身为百毫秒级的极短真实等待（线程超时无法用时钟模拟）。
 mvn test
 
-# 并发用例日志会打印每次判定的租约版本与依据，例如：
-# [concurrent-acquire] acquired=true  version=1 detail=acquired
-# [concurrent-acquire] acquired=false reason=LEASE_HELD_BY_OTHER detail=held by owner-15 version=1 remainingMs=10000
-
-# 本地启动 REST 服务（随机端口）
-mvn spring-boot:run
+# 用例日志会打印每次判定的租约版本与依据，例如：
+# [concurrent-acquire] acquired=false reason=LEASE_HELD_BY_OTHER detail=held by owner-0 version=1 remainingMs=10000
+# [late-submit-3] reason=OWNERSHIP_SUPERSEDED staleVersion=1 currentVersion=3 detail=requester=A version=1 current=A@v3
+# [steps-recovered] kind=ACCEPTED leaseVersion=3 step1Runs=1 step2Runs=2 step3Runs=1
 ```
+
+### REST 全链路验证
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
+B=http://localhost:8080/api/tasks
+
+# 1) 注册任务
+curl -X POST $B/job-1
+
+# 2) 并发抢占：并行发两个请求，只有一个赢家（另一个得到 LEASE_HELD_BY_OTHER + 当前版本）
+curl -X POST $B/job-1/acquire -H 'Content-Type: application/json' -d '{"ownerId":"inst-A","ttlMillis":30000}' &
+curl -X POST $B/job-1/acquire -H 'Content-Type: application/json' -d '{"ownerId":"inst-B","ttlMillis":30000}' &
+wait
+
+# 3) 记录/查询步骤进度（持有者可查，非持有者被拒）
+curl -X POST $B/job-1/steps -H 'Content-Type: application/json' \
+  -d '{"ownerId":"inst-B","version":1,"stepKey":"extract","note":"rows=100"}'
+curl "$B/job-1/progress?ownerId=inst-B&version=1"
+
+# 4) 提交结果；同一 businessKey 再提交一次 -> DUPLICATE（重复提交被认成重复）
+curl -X POST $B/job-1/submit -H 'Content-Type: application/json' \
+  -d '{"ownerId":"inst-B","version":1,"businessKey":"bk-1","payload":"done"}'
+
+# 5) 演示执行：workMillis > timeoutMillis -> EXECUTION_TIMEOUT，任务进入 RETRY_WAITING
+curl -X POST $B/job-2
+curl -X POST $B/job-2/execute -H 'Content-Type: application/json' \
+  -d '{"ownerId":"inst-C","businessKey":"bk-2","timeoutMillis":300,"workMillis":5000,"fail":false}'
+curl $B/job-2   # status=RETRY_WAITING, lastFailureReason=execution-timeout...
+
+# 6) 上报失败（可重试进入退避；NON_RETRYABLE 直接 DEAD）
+curl -X POST $B/job-3/failure -H 'Content-Type: application/json' \
+  -d '{"ownerId":"inst-D","version":1,"kind":"RETRYABLE","reason":"downstream-503"}'
+
+# 其它：续约 / 释放 / 查询 / 取消
+curl -X POST $B/job-1/renew  -H 'Content-Type: application/json' -d '{"ownerId":"inst-B","version":1,"ttlMillis":30000}'
+curl -X POST $B/job-1/release -H 'Content-Type: application/json' -d '{"ownerId":"inst-B","version":1}'
+curl $B                      # 当前可调度任务
+curl -X POST $B/job-1/cancel
+```
+
+## 兼容范围
+
+- **原有调用方式照常可用**：`LeaseManager` 的 acquire/renew/release/submitResult/reportFailure/
+  cancel 及各查询方法签名与语义不变；`TaskScheduler.runOnce(taskId, ownerId, businessKey, executor)`
+  旧签名保留，行为仅新增“执行不得超过默认时限（= 租约 TTL）”的兜底保护。
+- 步骤级进度（recordStep/progress/runSteps）为**可选新增**，不引入任何对既有调用方的强制改动。
+- `SubmitOutcome` 新增 `leaseVersion` 字段（判定时的当前租约版本，无租约为 null），
+  既有 `kind()/reason()/detail()` 访问方式不变。
 
 ## 代码结构
 
 ```
 lease/Clock/MutableClock/SystemClock   可控时间源
 lease/Lease                            租约（含 fencing token 版本）
-lease/LeaseManager                     共享状态：获取/续约/释放/回收/提交/失败上报/查询
-lease/TaskScheduler                    调度器：抢占 -> 执行 -> 提交或上报失败
+lease/LeaseManager                     共享状态：获取/续约/释放/回收/提交/失败上报/步骤进度/查询
+lease/TaskScheduler                    调度器：抢占 -> 限时执行 -> 提交或上报失败；步骤级续跑
+lease/TaskStep/ProgressView            步骤定义与进度查询视图
 lease/RetryPolicy                      重试次数与指数退避上限
 lease/TaskRecord/TaskSnapshot          内部状态与只读视图
 lease/RejectReason/ErrorKind/TaskStatus 可解释的判定枚举
-web/TaskController                     本地验证 REST 接口
+web/TaskController                     本地验证 REST 接口（注册/查询/抢占/提交/失败/步骤/演示执行）
 ```

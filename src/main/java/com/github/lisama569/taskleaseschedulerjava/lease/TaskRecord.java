@@ -2,6 +2,9 @@ package com.github.lisama569.taskleaseschedulerjava.lease;
 
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /** 任务的本地共享状态（多实例通过同一 LeaseManager 竞争它）。 */
@@ -19,6 +22,10 @@ public final class TaskRecord {
     private String result;
     /** 已应用结果的业务键，保证幂等。 */
     private final Set<String> appliedBusinessKeys = new HashSet<>();
+    /** 当前持有者记录的已完成步骤（stepKey -> 备注），按记录顺序排列。 */
+    private final Map<String, String> completedSteps = new LinkedHashMap<>();
+    /** 步骤进度的归属者：只有同一 owner 重新获得租约时才继承进度，否则清空。 */
+    private String stepsOwner;
 
     public TaskRecord(String taskId, int maxAttempts) {
         this.taskId = taskId;
@@ -44,4 +51,21 @@ public final class TaskRecord {
     public void result(String r) { this.result = r; }
     public boolean hasApplied(String businessKey) { return appliedBusinessKeys.contains(businessKey); }
     public void markApplied(String businessKey) { appliedBusinessKeys.add(businessKey); }
+
+    /** 记录一个已完成步骤（同一 stepKey 重复记录幂等，保留首次顺序）。 */
+    public void recordStep(String ownerId, String stepKey, String note) {
+        if (completedSteps.isEmpty()) {
+            stepsOwner = ownerId;
+        }
+        completedSteps.putIfAbsent(stepKey, note);
+    }
+
+    public List<String> completedStepKeys() { return List.copyOf(completedSteps.keySet()); }
+    public String stepsOwner() { return stepsOwner; }
+
+    /** 清空步骤进度：持有者变更或任务进入终态时调用。 */
+    public void clearSteps() {
+        completedSteps.clear();
+        stepsOwner = null;
+    }
 }

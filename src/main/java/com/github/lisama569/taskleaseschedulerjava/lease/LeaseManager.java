@@ -70,6 +70,11 @@ public class LeaseManager {
             }
             long newVersion = r.nextVersion();
             Lease lease = new Lease(taskId, ownerId, newVersion, now, now.plus(ttl));
+            // 步骤进度所有权隔离：持有者变更（租约过期/被回收/被抢走后被他人获取）
+            // 时清除旧进度，新持有者拿到干净起点；同一 owner 重新获得租约视为恢复，保留进度。
+            if (r.stepsOwner() != null && !r.stepsOwner().equals(ownerId)) {
+                r.clearSteps();
+            }
             r.lease(lease);
             r.status(TaskStatus.LEASED);
             r.incrementAttempts();
@@ -129,23 +134,27 @@ public class LeaseManager {
             return SubmitOutcome.rejected(RejectReason.TASK_NOT_FOUND, "no such task: " + taskId);
         }
         synchronized (r) {
+            Long curVersion = r.lease() == null ? null : r.lease().version();
             if (r.hasApplied(businessKey)) {
-                return SubmitOutcome.duplicate();
+                return SubmitOutcome.duplicate(curVersion);
             }
             if (r.status() == TaskStatus.SUCCEEDED || r.status() == TaskStatus.DEAD
                     || r.status() == TaskStatus.CANCELLED) {
                 return SubmitOutcome.rejected(RejectReason.TASK_FINISHED,
-                        "task is " + r.status() + ", businessKey not applied: " + businessKey);
+                        "task is " + r.status() + ", businessKey not applied: " + businessKey,
+                        curVersion);
             }
             RejectReason invalid = checkHolder(r, r.lease(), ownerId, version, clock.now());
             if (invalid != null) {
-                return SubmitOutcome.rejected(invalid, describe(r.lease(), ownerId, version));
+                return SubmitOutcome.rejected(invalid, describe(r.lease(), ownerId, version),
+                        curVersion);
             }
             r.markApplied(businessKey);
             r.result(payload);
             r.lease(null);
+            r.clearSteps();
             r.status(TaskStatus.SUCCEEDED);
-            return SubmitOutcome.accepted();
+            return SubmitOutcome.accepted(version);
         }
     }
 
@@ -166,6 +175,7 @@ public class LeaseManager {
             r.lease(null);
             if (kind == ErrorKind.NON_RETRYABLE || r.attempts() >= r.maxAttempts()) {
                 r.status(TaskStatus.DEAD);
+                r.clearSteps();
                 return LeaseDecision.rejected(RejectReason.TASK_FINISHED,
                         "task DEAD: kind=" + kind + " attempts=" + r.attempts());
             }
@@ -187,8 +197,52 @@ public class LeaseManager {
                 return false;
             }
             r.lease(null);
+            r.clearSteps();
             r.status(TaskStatus.CANCELLED);
             return true;
+        }
+    }
+
+    /**
+     * 记录一个已完成步骤（可选的步骤级进度 API）。
+     * 仅当前持有者（owner + version 匹配且未过期）可记录；同一 stepKey 重复记录幂等。
+     */
+    public LeaseDecision recordStep(String taskId, String ownerId, long version,
+                                    String stepKey, String note) {
+        if (stepKey == null || stepKey.isBlank()) {
+            return LeaseDecision.rejected(RejectReason.INVALID_ARGUMENT, "stepKey required");
+        }
+        TaskRecord r = tasks.get(taskId);
+        if (r == null) {
+            return LeaseDecision.rejected(RejectReason.TASK_NOT_FOUND, "no such task: " + taskId);
+        }
+        synchronized (r) {
+            Lease cur = r.lease();
+            RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
+            if (invalid != null) {
+                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version));
+            }
+            r.recordStep(ownerId, stepKey, note);
+            return LeaseDecision.ok(cur);
+        }
+    }
+
+    /**
+     * 查询当前持有者的步骤进度。仅当前持有者可查，且返回的进度必然属于查询者：
+     * 持有者一旦变更，旧持有者的进度已在 acquire 时被清除。
+     */
+    public ProgressView progress(String taskId, String ownerId, long version) {
+        TaskRecord r = tasks.get(taskId);
+        if (r == null) {
+            return ProgressView.rejected(RejectReason.TASK_NOT_FOUND, "no such task: " + taskId);
+        }
+        synchronized (r) {
+            Lease cur = r.lease();
+            RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
+            if (invalid != null) {
+                return ProgressView.rejected(invalid, describe(cur, ownerId, version));
+            }
+            return ProgressView.of(cur.version(), r.completedStepKeys());
         }
     }
 
