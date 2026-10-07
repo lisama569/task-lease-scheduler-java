@@ -71,13 +71,21 @@ class StepProgressTest {
         clock.advance(Duration.ofSeconds(6)); // 租约过期
         assertEquals(1, manager.reclaimExpired());
 
-        // 旧持有者查询/记录被拒：租约已过期
+        // 旧持有者查询/记录被拒：租约已过期（与“被别人接手/不是持有者”稳定区分）
         ProgressView stale = manager.progress("t", "A", v1.version());
-        log.info("[stale-progress] ok={} reason={} detail={}", stale.ok(), stale.reason(),
-                stale.detail());
+        log.info("[stale-progress] ok={} reason={} leaseVersion={} detail={}", stale.ok(),
+                stale.reason(), stale.leaseVersion(), stale.detail());
         assertFalse(stale.ok());
-        assertEquals(RejectReason.NOT_LEASE_HOLDER, stale.reason(),
-                "租约被回收后旧持有者不再持有任何进度");
+        assertEquals(RejectReason.LEASE_EXPIRED, stale.reason(),
+                "租约到期被回收、尚无新持有者接手时，旧持有者得到 LEASE_EXPIRED");
+        assertEquals(v1.version(), stale.leaseVersion(), "结论必须带可核对的租约版本");
+
+        // 从未持有过租约的执行者：NOT_LEASE_HOLDER（与“过期”“被接手”区分）
+        ProgressView stranger = manager.progress("t", "X", 999L);
+        log.info("[stranger-progress] ok={} reason={} leaseVersion={} detail={}",
+                stranger.ok(), stranger.reason(), stranger.leaseVersion(), stranger.detail());
+        assertFalse(stranger.ok());
+        assertEquals(RejectReason.NOT_LEASE_HOLDER, stranger.reason());
 
         // 新持有者拿到干净、确定的起点
         Lease v2 = manager.acquire("t", "B", Duration.ofSeconds(30)).lease();
@@ -93,11 +101,16 @@ class StepProgressTest {
         manager.recordStep("t", "B", v2.version(), "extract", "rows=100");
         assertEquals(List.of("extract"), manager.progress("t", "B", v2.version()).completedSteps());
 
-        // 旧持有者以旧版本提交进度/结果：版本被取代，可区分
+        // 任务已被 B 接手：旧持有者以旧版本补记进度 -> OWNERSHIP_SUPERSEDED，写不进新持有者进度
         LeaseDecision late = manager.recordStep("t", "A", v1.version(), "load", null);
         log.info("[late-record] reason={} currentVersion={} detail={}",
                 late.reason(), v2.version(), late.detail());
-        assertEquals(RejectReason.NOT_LEASE_HOLDER, late.reason());
+        assertEquals(RejectReason.OWNERSHIP_SUPERSEDED, late.reason(),
+                "任务已被别人接手，旧持有者补记进度必须识别为 OWNERSHIP_SUPERSEDED");
+        assertEquals(v2.version(), late.leaseVersion(), "拒绝结论必须带当前租约版本");
+        assertEquals(List.of("extract"),
+                manager.progress("t", "B", v2.version()).completedSteps(),
+                "旧执行者不得写坏新持有者的进度");
     }
 
     @Test

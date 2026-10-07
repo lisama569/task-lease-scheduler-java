@@ -16,4 +16,8 @@ public record ProgressView(boolean ok, RejectReason reason, String detail,
     public static ProgressView rejected(RejectReason reason, String detail) {
         return new ProgressView(false, reason, detail, null, List.of());
     }
+
+    public static ProgressView rejected(RejectReason reason, String detail, Long leaseVersion) {
+        return new ProgressView(false, reason, detail, leaseVersion, List.of());
+    }
 }
