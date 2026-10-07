@@ -16,4 +16,9 @@ public record ProgressView(boolean ok, RejectReason reason, String detail,
     public static ProgressView rejected(RejectReason reason, String detail) {
         return new ProgressView(false, reason, detail, null, List.of());
     }
+
+    /** 拒绝但带上判定时当前租约版本，便于对照日志复现。 */
+    public static ProgressView rejected(RejectReason reason, String detail, Long leaseVersion) {
+        return new ProgressView(false, reason, detail, leaseVersion, List.of());
+    }
 }

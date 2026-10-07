@@ -113,4 +113,54 @@ class LeaseExpiryTest {
         assertEquals(TaskStatus.PENDING, manager.snapshot("t").orElseThrow().status());
         assertEquals(1, manager.schedulable().size());
     }
+
+    @Test
+    void reportFailure_acceptedOnExpiredButOwnLease_immediateRetry() {
+        // 执行时限 == 租约时长的核心场景：租约刚好过期，但版本未被取代，
+        // 持有者上报失败必须被接受，任务立刻进入退避重试且原因被记录
+        Lease lease = manager.acquire("t", "A", Duration.ofSeconds(5)).lease();
+        clock.advance(Duration.ofSeconds(5)); // 恰好卡满整段租约
+        LeaseDecision f = manager.reportFailure("t", "A", lease.version(),
+                ErrorKind.RETRYABLE, "execution-timeout after 5000ms");
+        log.info("[failure-on-expired-own-lease] accepted={} reason={} detail={}",
+                f.acquired(), f.reason(), f.detail());
+        assertTrue(f.acquired(), "租约过期但版本未被取代时，失败上报必须被接受");
+
+        TaskSnapshot snap = manager.snapshot("t").orElseThrow();
+        assertEquals(TaskStatus.RETRY_WAITING, snap.status());
+        assertEquals("execution-timeout after 5000ms", snap.lastFailureReason());
+        clock.advance(Duration.ofMillis(100)); // 退避到期
+        assertEquals(1, manager.schedulable().size(), "不依赖租约被动回收即可重新调度");
+    }
+
+    @Test
+    void reportFailure_rejectedAfterTakeover_cannotClobberNewHolder() {
+        Lease v1 = manager.acquire("t", "A", Duration.ofSeconds(5)).lease();
+        clock.advance(Duration.ofSeconds(6));
+        Lease v2 = manager.acquire("t", "B", Duration.ofSeconds(30)).lease();
+
+        // 旧持有者上报失败：被识别为“所有权已被取代”，新持有者的租约不受影响
+        LeaseDecision stale = manager.reportFailure("t", "A", v1.version(),
+                ErrorKind.RETRYABLE, "stale-timeout");
+        log.info("[stale-failure-report] accepted={} reason={} currentVersion={} detail={}",
+                stale.acquired(), stale.reason(), stale.currentVersion(), stale.detail());
+        assertFalse(stale.acquired());
+        assertEquals(RejectReason.OWNERSHIP_SUPERSEDED, stale.reason());
+        assertEquals(v2.version(), stale.currentVersion());
+
+        TaskSnapshot snap = manager.snapshot("t").orElseThrow();
+        assertEquals(TaskStatus.LEASED, snap.status(), "旧持有者不得写坏新持有者的状态");
+        assertEquals("B", snap.ownerId());
+        assertNull(snap.lastFailureReason());
+
+        // 从未持有过的执行者上报失败：NOT_LEASE_HOLDER，与“被取代”可区分
+        LeaseDecision stranger = manager.reportFailure("t", "stranger", v1.version(),
+                ErrorKind.RETRYABLE, "bogus");
+        assertEquals(RejectReason.NOT_LEASE_HOLDER, stranger.reason());
+
+        // 新持有者正常提交，结果不被旧持有者影响
+        assertEquals(SubmitOutcome.Kind.ACCEPTED,
+                manager.submitResult("t", "B", v2.version(), "bk-B", "B-done").kind());
+        assertEquals("B-done", manager.snapshot("t").orElseThrow().result());
+    }
 }

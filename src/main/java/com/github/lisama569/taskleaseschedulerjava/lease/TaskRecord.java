@@ -1,6 +1,7 @@
 package com.github.lisama569.taskleaseschedulerjava.lease;
 
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,6 +25,13 @@ public final class TaskRecord {
     private final Set<String> appliedBusinessKeys = new HashSet<>();
     /** 当前持有者记录的已完成步骤（stepKey -> 备注），按记录顺序排列。 */
     private final Map<String, String> completedSteps = new LinkedHashMap<>();
+    /**
+     * 每个 owner 最近一次持有过的租约（ownerId -> 租约）。
+     * 租约被释放/回收/取代后仍保留，用于在租约已不在位时区分：
+     * “我曾持有但已过期/被回收”（LEASE_EXPIRED）、“我曾持有但已被别人接手”
+     * （OWNERSHIP_SUPERSEDED）与“从未持有过”（NOT_LEASE_HOLDER）。
+     */
+    private final Map<String, Lease> lastLeaseByOwner = new HashMap<>();
     /** 步骤进度的归属者：只有同一 owner 重新获得租约时才继承进度，否则清空。 */
     private String stepsOwner;
 
@@ -62,6 +70,16 @@ public final class TaskRecord {
 
     public List<String> completedStepKeys() { return List.copyOf(completedSteps.keySet()); }
     public String stepsOwner() { return stepsOwner; }
+
+    /** 记录某 owner 最近一次持有的租约（获取/续约时调用）。 */
+    public void noteHeldLease(Lease lease) {
+        lastLeaseByOwner.put(lease.ownerId(), lease);
+    }
+
+    /** 该 owner 最近一次持有过的租约；从未持有过返回 null。 */
+    public Lease lastLeaseOf(String ownerId) {
+        return lastLeaseByOwner.get(ownerId);
+    }
 
     /** 清空步骤进度：持有者变更或任务进入终态时调用。 */
     public void clearSteps() {

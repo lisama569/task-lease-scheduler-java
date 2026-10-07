@@ -143,20 +143,29 @@ class ExecutionTimeoutTest {
                 id -> interruptibleWait(unblock));
         assertEquals(RejectReason.EXECUTION_TIMEOUT, timedOut.reason());
 
-        // 1) 超时后租约已释放：旧持有者不再持有租约
+        // 1) 超时后租约已随失败上报结束、尚无人接手：旧持有者曾持有该版本 -> 租约已失效
         SubmitOutcome late1 = manager.submitResult("t", "A", 1, "bk-late", "stale");
         log.info("[late-submit-1] reason={} currentVersion={} detail={}",
                 late1.reason(), late1.leaseVersion(), late1.detail());
-        assertEquals(RejectReason.NOT_LEASE_HOLDER, late1.reason());
+        assertEquals(RejectReason.LEASE_EXPIRED, late1.reason());
 
-        // 2) 任务被别人接管：旧持有者依然不是当前持有者
+        // 1b) 从未持有过租约的执行者：与“曾持有但失效”可区分
+        SubmitOutcome stranger = manager.submitResult("t", "stranger", 1, "bk-late", "stale");
+        log.info("[stranger-submit] reason={} detail={}", stranger.reason(), stranger.detail());
+        assertEquals(RejectReason.NOT_LEASE_HOLDER, stranger.reason());
+
+        // 2) 任务被别人接管：旧持有者被识别为“所有权已被取代”，与 NOT_LEASE_HOLDER 区分
         clock.advance(Duration.ofMillis(100));
         Lease vB = manager.acquire("t", "B", LEASE_TTL).lease();
         SubmitOutcome late2 = manager.submitResult("t", "A", 1, "bk-late", "stale");
         log.info("[late-submit-2] reason={} currentVersion={} detail={}",
                 late2.reason(), late2.leaseVersion(), late2.detail());
-        assertEquals(RejectReason.NOT_LEASE_HOLDER, late2.reason());
-        assertEquals(vB.version(), late2.leaseVersion());
+        assertEquals(RejectReason.OWNERSHIP_SUPERSEDED, late2.reason());
+        assertEquals(vB.version(), late2.leaseVersion(), "判定必须带上当前租约版本便于核对");
+
+        // 2b) 此时一个从未持有过的执行者仍是 NOT_LEASE_HOLDER，两种拒绝不混淆
+        SubmitOutcome stranger2 = manager.submitResult("t", "stranger", 1, "bk-late", "stale");
+        assertEquals(RejectReason.NOT_LEASE_HOLDER, stranger2.reason());
 
         // 3) 旧持有者重新抢到租约（版本+1）：旧版本提交被 fencing 判定取代
         assertTrue(manager.release("t", "B", vB.version()).acquired());
@@ -172,6 +181,13 @@ class ExecutionTimeoutTest {
         log.info("[late-submit-4] reason={} version={} detail={}",
                 late4.reason(), late4.leaseVersion(), late4.detail());
         assertEquals(RejectReason.LEASE_EXPIRED, late4.reason());
+
+        // 4b) 租约过期并被回收后，旧持有者回来提交仍是 LEASE_EXPIRED，而非 NOT_LEASE_HOLDER
+        assertEquals(1, manager.reclaimExpired());
+        SubmitOutcome late5 = manager.submitResult("t", "A", vA2.version(), "bk-late", "stale");
+        log.info("[late-submit-5-after-reclaim] reason={} detail={}",
+                late5.reason(), late5.detail());
+        assertEquals(RejectReason.LEASE_EXPIRED, late5.reason());
 
         // 新持有者正常提交不受旧持有者影响
         Lease vC = manager.acquire("t", "C", LEASE_TTL).lease();
@@ -228,5 +244,67 @@ class ExecutionTimeoutTest {
         log.info("[legacy-runOnce] kind={} leaseVersion={}", out.kind(), out.leaseVersion());
         assertEquals(SubmitOutcome.Kind.ACCEPTED, out.kind());
         assertEquals("legacy-ok", manager.snapshot("t").orElseThrow().result());
+    }
+
+    /**
+     * 执行时限 == 租约时长（含不显式传时限的旧调用方式）：卡满上限时必须得到确定失败结论，
+     * 任务立刻回到可重试状态，而不是保持“被别人占着”直到租约被动回收。
+     * 业务时间由 MutableClock 推进模拟“真的卡满整段上限”，不靠真实等待撑出租约过期。
+     */
+    @Test
+    void timeoutEqualToLeaseTtl_deterministicFailure_andImmediateRetry() {
+        Duration ttl = Duration.ofMillis(200);
+        TaskScheduler tight = new TaskScheduler(manager, ttl); // 默认执行时限 == 租约 TTL
+        AtomicBoolean unblock = new AtomicBoolean(false);
+
+        // 旧调用方式：不显式传执行时限。执行体先把业务时钟推进满整个租约时长
+        // （模拟这次执行真的卡满上限），再阻塞直到被超时取消。
+        SubmitOutcome out = tight.runOnce("t", "A", "bk-1", id -> {
+            clock.advance(ttl);
+            return interruptibleWait(unblock);
+        });
+        log.info("[timeout-eq-ttl] kind={} reason={} leaseVersion={} detail={}",
+                out.kind(), out.reason(), out.leaseVersion(), out.detail());
+        assertEquals(SubmitOutcome.Kind.REJECTED, out.kind());
+        assertEquals(RejectReason.EXECUTION_TIMEOUT, out.reason());
+
+        // 确定结论：失败原因已记录，任务立刻进入退避重试，而不是仍显示被占着
+        TaskSnapshot snap = manager.snapshot("t").orElseThrow();
+        log.info("[after-timeout-eq-ttl] status={} lastError={} reason={} nextRetryAt={}",
+                snap.status(), snap.lastErrorKind(), snap.lastFailureReason(),
+                snap.nextRetryAt());
+        assertEquals(TaskStatus.RETRY_WAITING, snap.status(),
+                "卡满上限后任务必须立刻进入重试，而不是等租约被动回收");
+        assertEquals(ErrorKind.RETRYABLE, snap.lastErrorKind());
+        assertNotNull(snap.lastFailureReason(), "超时失败原因必须被记录");
+        assertTrue(snap.lastFailureReason().contains("execution-timeout"));
+        assertNull(snap.result());
+
+        // 退避到期后立刻可重新调度并成功（不需要等租约剩余时间）
+        clock.advance(Duration.ofMillis(100));
+        assertEquals(1, manager.schedulable().size());
+        SubmitOutcome recovered = tight.runOnce("t", "B", "bk-1", id -> "ok");
+        log.info("[recovered-after-tight-timeout] kind={} leaseVersion={}",
+                recovered.kind(), recovered.leaseVersion());
+        assertEquals(SubmitOutcome.Kind.ACCEPTED, recovered.kind());
+        assertEquals(TaskStatus.SUCCEEDED, manager.snapshot("t").orElseThrow().status());
+    }
+
+    /** 显式传与租约等长的执行时限，同样必须立即失败并回到可重试状态。 */
+    @Test
+    void explicitTimeoutEqualToLeaseTtl_alsoRecoversImmediately() {
+        Duration ttl = Duration.ofMillis(200);
+        TaskScheduler tight = new TaskScheduler(manager, ttl);
+        AtomicBoolean unblock = new AtomicBoolean(false);
+
+        SubmitOutcome out = tight.runOnce("t", "A", "bk-1", ttl, id -> {
+            clock.advance(ttl);
+            return interruptibleWait(unblock);
+        });
+        log.info("[explicit-timeout-eq-ttl] kind={} reason={} detail={}",
+                out.kind(), out.reason(), out.detail());
+        assertEquals(RejectReason.EXECUTION_TIMEOUT, out.reason());
+        assertEquals(TaskStatus.RETRY_WAITING, manager.snapshot("t").orElseThrow().status());
+        assertNotNull(manager.snapshot("t").orElseThrow().lastFailureReason());
     }
 }

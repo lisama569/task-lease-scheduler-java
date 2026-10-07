@@ -76,6 +76,7 @@ public class LeaseManager {
                 r.clearSteps();
             }
             r.lease(lease);
+            r.noteHeldLease(lease);
             r.status(TaskStatus.LEASED);
             r.incrementAttempts();
             r.nextRetryAt(null);
@@ -93,11 +94,13 @@ public class LeaseManager {
             Lease cur = r.lease();
             RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
             if (invalid != null) {
-                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version));
+                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version),
+                        cur == null ? null : cur.version());
             }
             Lease renewed = new Lease(taskId, ownerId, version, cur.acquiredAt(),
                     clock.now().plus(ttl));
             r.lease(renewed);
+            r.noteHeldLease(renewed);
             return LeaseDecision.ok(renewed);
         }
     }
@@ -112,7 +115,8 @@ public class LeaseManager {
             Lease cur = r.lease();
             RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
             if (invalid != null) {
-                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version));
+                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version),
+                        cur == null ? null : cur.version());
             }
             r.lease(null);
             r.status(TaskStatus.PENDING);
@@ -158,7 +162,11 @@ public class LeaseManager {
         }
     }
 
-    /** 上报失败：可重试错误进入退避等待，不可重试或超上限进入 DEAD 终态。 */
+    /**
+     * 上报失败：可重试错误进入退避等待，不可重试或超上限进入 DEAD 终态。
+     * 租约已过期但版本未被取代（仍是自己那一版）时也接受上报——
+     * 执行时限与租约时长相同、卡满上限的场景依赖这一点得到确定结论。
+     */
     public LeaseDecision reportFailure(String taskId, String ownerId, long version,
                                        ErrorKind kind, String reason) {
         TaskRecord r = tasks.get(taskId);
@@ -166,9 +174,10 @@ public class LeaseManager {
             return LeaseDecision.rejected(RejectReason.TASK_NOT_FOUND, "no such task: " + taskId);
         }
         synchronized (r) {
-            RejectReason invalid = checkHolder(r, r.lease(), ownerId, version, clock.now());
+            RejectReason invalid = checkHolderForFailureReport(r, r.lease(), ownerId, version);
             if (invalid != null) {
-                return LeaseDecision.rejected(invalid, describe(r.lease(), ownerId, version));
+                return LeaseDecision.rejected(invalid, describe(r.lease(), ownerId, version),
+                        r.lease() == null ? null : r.lease().version());
             }
             r.lastErrorKind(kind);
             r.lastFailureReason(reason);
@@ -220,7 +229,8 @@ public class LeaseManager {
             Lease cur = r.lease();
             RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
             if (invalid != null) {
-                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version));
+                return LeaseDecision.rejected(invalid, describe(cur, ownerId, version),
+                        cur == null ? null : cur.version());
             }
             r.recordStep(ownerId, stepKey, note);
             return LeaseDecision.ok(cur);
@@ -240,7 +250,8 @@ public class LeaseManager {
             Lease cur = r.lease();
             RejectReason invalid = checkHolder(r, cur, ownerId, version, clock.now());
             if (invalid != null) {
-                return ProgressView.rejected(invalid, describe(cur, ownerId, version));
+                return ProgressView.rejected(invalid, describe(cur, ownerId, version),
+                        cur == null ? null : cur.version());
             }
             return ProgressView.of(cur.version(), r.completedStepKeys());
         }
@@ -320,23 +331,53 @@ public class LeaseManager {
         return out;
     }
 
-    /** 持有者校验：依次区分 非持有者 / 版本被取代 / 租约过期。 */
+    /**
+     * 持有者校验（写操作/进度/续约用）：通过则返回 null；拒绝时三种情形互相区分——
+     * OWNERSHIP_SUPERSEDED：请求者曾持有该版本租约，但任务已被别人（或同 owner 的新版本）接手；
+     * LEASE_EXPIRED：请求者持有的租约已过期/被回收，且尚无人接手；
+     * NOT_LEASE_HOLDER：请求者从未持有过该版本租约（压根不是持有者）。
+     */
     private static RejectReason checkHolder(TaskRecord r, Lease cur, String ownerId,
                                             long version, Instant now) {
         if (r.status() == TaskStatus.CANCELLED || r.status() == TaskStatus.DEAD
                 || r.status() == TaskStatus.SUCCEEDED) {
             return RejectReason.TASK_FINISHED;
         }
-        if (cur == null || !cur.ownerId().equals(ownerId)) {
-            return RejectReason.NOT_LEASE_HOLDER;
+        if (cur != null && cur.ownerId().equals(ownerId)) {
+            if (cur.version() != version) {
+                return RejectReason.OWNERSHIP_SUPERSEDED; // 同一 owner 的版本已轮换
+            }
+            return cur.isExpired(now) ? RejectReason.LEASE_EXPIRED : null;
         }
-        if (cur.version() != version) {
-            return RejectReason.OWNERSHIP_SUPERSEDED;
+        // 当前租约不在请求者手里（或已无租约）：回看请求者是否持有过该版本
+        Lease prev = r.lastLeaseOf(ownerId);
+        boolean wasHolderOfVersion = prev != null && prev.version() == version;
+        if (cur != null) {
+            // 任务已被别人接手
+            return wasHolderOfVersion ? RejectReason.OWNERSHIP_SUPERSEDED
+                    : RejectReason.NOT_LEASE_HOLDER;
         }
-        if (cur.isExpired(now)) {
-            return RejectReason.LEASE_EXPIRED;
+        // 当前无租约：曾持有该版本说明租约已过期/被回收/已随失败上报结束
+        return wasHolderOfVersion ? RejectReason.LEASE_EXPIRED
+                : RejectReason.NOT_LEASE_HOLDER;
+    }
+
+    /**
+     * 失败上报专用的持有者校验：租约已过期但版本未被取代（仍是自己那一版、无人接手）
+     * 时仍允许上报。这样执行时限 == 租约时长时，卡满上限的执行也能把失败落定，
+     * 让任务立刻进入重试，而不是干等租约被动回收。安全性：只要版本未被取代，
+     * 其他执行者就不可能已经拿到该任务，状态转换仍只有当前持有者能触发。
+     */
+    private static RejectReason checkHolderForFailureReport(TaskRecord r, Lease cur,
+                                                            String ownerId, long version) {
+        if (r.status() == TaskStatus.CANCELLED || r.status() == TaskStatus.DEAD
+                || r.status() == TaskStatus.SUCCEEDED) {
+            return RejectReason.TASK_FINISHED;
         }
-        return null;
+        if (cur != null && cur.ownerId().equals(ownerId) && cur.version() == version) {
+            return null; // 仍是自己那一版：即使已过期也允许把失败落定
+        }
+        return checkHolder(r, cur, ownerId, version, Instant.MAX);
     }
 
     private static String describe(Lease cur, String ownerId, long version) {

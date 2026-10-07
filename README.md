@@ -46,15 +46,22 @@
   执行在受控线程中运行，调度线程以 `executionTimeout` 为上限等待结果。
 - **超时**：取消执行线程（中断），按可恢复失败上报（`RETRY_WAITING` + 退避），
   返回 `EXECUTION_TIMEOUT`。任务立刻回到可调度状态，而不是干等租约到期。
+  **执行时限允许等于租约时长**（不显式传时限的旧调用方式默认就是相等）：
+  即使这次执行真的卡满整段上限、租约刚好过期，只要租约版本尚未被取代，
+  失败上报依然被接受（见下文 `reportFailure` 的判定），超时原因被记录，
+  任务立刻进入退避重试，而不是保持“被别人占着”直到租约被动回收。
 - **外部打断**（调度线程被中断、实例停机）：取消执行、恢复中断标记、按可恢复失败上报，
   返回 `EXECUTION_INTERRUPTED`；执行期间若观察到中断信号，即使 executor 已返回结果
   也**不会提交**——没跑完/可能不完整的执行绝不会被当成成功。
 - **异常**：executor 抛异常按可重试失败上报，返回 `EXECUTION_FAILED`。
-- 超时/打断后租约已被释放，原持有者再提交结果会被拒绝，且原因可区分：
-  - 租约已释放/被他人持有 → `NOT_LEASE_HOLDER`
-  - 同一持有者重新抢到租约（版本已 +1）→ `OWNERSHIP_SUPERSEDED`
-  - 租约自然过期 → `LEASE_EXPIRED`
-  无论哪种情况，旧持有者都**无法覆盖**新持有者的状态。
+- 超时/打断后租约已结束，原持有者再提交结果或补记进度会被拒绝。
+  系统会记住每个执行者最近一次持有过的租约（owner → 最近一次租约），
+  因此三种情形各自给出**稳定且互相区分**的结论，判定结果都带当前租约版本便于核对：
+  - 曾持有该版本、租约已过期/被回收/已随失败上报结束，且尚无人接手 → `LEASE_EXPIRED`
+  - 曾持有该版本、但任务已被别人接手（或同一 owner 的租约版本已轮换）
+    → `OWNERSHIP_SUPERSEDED`
+  - 从未持有过该版本租约（压根不是持有者）→ `NOT_LEASE_HOLDER`
+  无论哪种情况，旧持有者都**无法覆盖**新持有者的结果或进度。
 
 ### 步骤级进度与续跑（可选 API）
 
@@ -84,11 +91,18 @@
 1. **幂等优先**：`businessKey` 已应用过 → `DUPLICATE`，不产生任何副作用，
    同一业务键的重复提交/重试安全。
 2. **终态拒绝**：任务已 SUCCEEDED/DEAD/CANCELLED 且业务键未见过 → `TASK_FINISHED`。
-3. **所有权校验**（可区分原因，绝不静默覆盖新持有者）：
-   - 非当前持有者 → `NOT_LEASE_HOLDER`
-   - 版本落后于当前租约（fencing token 被取代）→ `OWNERSHIP_SUPERSEDED`
-   - 租约已过期 → `LEASE_EXPIRED`
+3. **所有权校验**（三种拒绝稳定可区分，绝不静默覆盖新持有者）：
+   - 曾持有该版本但任务已被别人接手 / 版本已轮换 → `OWNERSHIP_SUPERSEDED`
+   - 曾持有该版本但租约已过期、被回收或已随失败上报结束 → `LEASE_EXPIRED`
+   - 从未持有过该版本租约 → `NOT_LEASE_HOLDER`
 4. 全部通过 → `ACCEPTED`：记录业务键、写入结果、任务进入 SUCCEEDED。
+
+`reportFailure` 的所有权校验与上面略有不同：**租约已过期但版本未被取代**
+（仍是自己那一版、无人接手）时依然接受上报。这是“执行时限 == 租约时长”场景的
+关键：卡满上限的执行在租约刚好过期后才上报，也必须得到确定结论并立刻进入重试。
+安全性不受影响——只要 fencing token 未被取代，其他执行者就不可能已经拿到该任务；
+一旦别人接手（版本变大），旧持有者的失败上报会被 `OWNERSHIP_SUPERSEDED` 拒绝，
+无法写坏新持有者的状态。
 
 参数非法（空 businessKey、空 ownerId、非法 TTL）→ `INVALID_ARGUMENT`；
 任务不存在 → `TASK_NOT_FOUND`。
@@ -118,16 +132,43 @@
 ### 自动化测试
 
 ```bash
-# 全部测试：并发抢占 / 租约到期 / 幂等重复提交 / 失败恢复 / 执行超时与打断 / 步骤进度隔离
+# 全部测试：并发抢占 / 租约到期 / 幂等重复提交 / 失败恢复 / 执行超时与打断 / 步骤进度隔离 /
+# 执行时限==租约时长的超时恢复 / 三种拒绝情形的区分
 # 租约与退避时间使用 MutableClock 可控时间源，无真实等待；
 # 执行超时本身为百毫秒级的极短真实等待（线程超时无法用时钟模拟）。
 mvn test
 
 # 用例日志会打印每次判定的租约版本与依据，例如：
 # [concurrent-acquire] acquired=false reason=LEASE_HELD_BY_OTHER detail=held by owner-0 version=1 remainingMs=10000
-# [late-submit-3] reason=OWNERSHIP_SUPERSEDED staleVersion=1 currentVersion=3 detail=requester=A version=1 current=A@v3
+# [late-submit-2] reason=OWNERSHIP_SUPERSEDED currentVersion=2 detail=requester=A version=1 current=B@v2
+# [late-submit-5-after-reclaim] reason=LEASE_EXPIRED detail=requester=A version=3 current=none
+# [stranger-submit] reason=NOT_LEASE_HOLDER detail=requester=stranger version=1 current=none
+# [after-timeout-eq-ttl] status=RETRY_WAITING lastError=RETRYABLE reason=execution-timeout after 200ms
 # [steps-recovered] kind=ACCEPTED leaseVersion=3 step1Runs=1 step2Runs=2 step3Runs=1
 ```
+
+### 三种拒绝情形的本地复现
+
+对同一任务 `t`（租约版本从 1 开始）：
+
+1. **`LEASE_EXPIRED`**：A 拿到 v1 后不续约，等租约过期（测试里用 `MutableClock.advance`，
+   或 REST 下把 `ttlMillis` 设小并稍等），A 再以 v1 提交/记进度 → `LEASE_EXPIRED`。
+   过期后被 `reclaimExpired` 回收再提交，结论仍是 `LEASE_EXPIRED`。
+2. **`OWNERSHIP_SUPERSEDED`**：A 的 v1 过期后 B 抢到 v2，A 再以 v1 提交 →
+   `OWNERSHIP_SUPERSEDED`，判定里带 `currentVersion=2`。
+3. **`NOT_LEASE_HOLDER`**：从未拿过租约的执行者直接以任意版本提交 → `NOT_LEASE_HOLDER`。
+
+对应自动化用例：`ExecutionTimeoutTest.oldHolderSubmitRejected_afterTimeout_distinguishableReasons`、
+`LeaseExpiryTest.reportFailure_*`、`StepProgressTest.progressDoesNotLeakToNewHolder_afterExpiryAndTakeover`。
+
+### 执行时限 == 租约时长的本地复现
+
+- 自动化：`ExecutionTimeoutTest.timeoutEqualToLeaseTtl_deterministicFailure_andImmediateRetry`
+  用 `MutableClock` 把业务时间推进满整个租约时长来模拟“卡满上限”，断言任务立刻进入
+  `RETRY_WAITING` 且 `lastFailureReason` 已记录，而不是保持 `LEASED` 等被动回收。
+- REST：`POST /api/tasks/{id}/execute` 让 `timeoutMillis` 与调度器租约 TTL 相等且
+  `workMillis` 更大，随后 `GET /api/tasks/{id}` 应看到 `status=RETRY_WAITING` 与
+  `lastFailureReason=execution-timeout...`。
 
 ### REST 全链路验证
 
@@ -172,11 +213,17 @@ curl -X POST $B/job-1/cancel
 ## 兼容范围
 
 - **原有调用方式照常可用**：`LeaseManager` 的 acquire/renew/release/submitResult/reportFailure/
-  cancel 及各查询方法签名与语义不变；`TaskScheduler.runOnce(taskId, ownerId, businessKey, executor)`
-  旧签名保留，行为仅新增“执行不得超过默认时限（= 租约 TTL）”的兜底保护。
+  cancel 及各查询方法签名与基本语义不变；`TaskScheduler.runOnce(taskId, ownerId, businessKey, executor)`
+  旧签名保留，行为仅新增“执行不得超过默认时限（= 租约 TTL）”的兜底保护——
+  即使卡满该上限也能得到确定的超时失败结论并立刻进入重试。
 - 步骤级进度（recordStep/progress/runSteps）为**可选新增**，不引入任何对既有调用方的强制改动。
-- `SubmitOutcome` 新增 `leaseVersion` 字段（判定时的当前租约版本，无租约为 null），
-  既有 `kind()/reason()/detail()` 访问方式不变。
+- `SubmitOutcome` 带 `leaseVersion`、`LeaseDecision` 带 `currentVersion`、
+  `ProgressView` 带 `leaseVersion`（判定时的当前租约版本，无租约为 null），
+  既有 `kind()/reason()/detail()`、`acquired()/lease()` 等访问方式不变；
+  `LeaseDecision` 保留旧的四参构造。
+- 拒绝原因语义更细化（行为变更，属本次修复目标）：曾持有租约但已过期/被回收的提交
+  现在得到 `LEASE_EXPIRED`、被别人接手得到 `OWNERSHIP_SUPERSEDED`，
+  只有从未持有过该版本的执行者才得到 `NOT_LEASE_HOLDER`。
 
 ## 代码结构
 
